@@ -1,0 +1,11 @@
+[package]
+name = "spincell"
+version = "0.1.0"
+edition = "2021"
+licence-file = "LICENSE"
+license = "MIT"
+description = "A small, lightweight thread-safe cell implementation targeting no_std environments."
+repository = "https://github.com/ushiba0/spincell"
+readme = "README.md"
+
+[dependencies]
