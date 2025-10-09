@@ -1,44 +1,40 @@
 #![no_std]
 
 use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
+use core::mem::{ManuallyDrop, MaybeUninit};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub struct SpinCell<T: Sized> {
+pub struct SpinCell<T, G = fn() -> T> {
+    // A simple spin lock for serialized initialization.
     lock: AtomicBool,
+    // Whether the cell currently holds an initialized value.
+    // Readers should load this with Acquire to observe initialized data.
     is_initialized: AtomicBool,
     cell: MaybeUninit<UnsafeCell<T>>,
+    // Stored initializer function (consumed exactly once by the first
+    // thread that successfully initializes). Wrapped in UnsafeCell so it
+    // can be taken from &self during initialization.
+    init_func: UnsafeCell<ManuallyDrop<G>>,
 }
 
-unsafe impl<T: Sized + Sync> Sync for SpinCell<T> {}
-unsafe impl<T: Sized + Send> Send for SpinCell<T> {}
+unsafe impl<T: Sync, G> Sync for SpinCell<T, G> {}
+unsafe impl<T: Send, G> Send for SpinCell<T, G> {}
 
-impl<T: Sized> SpinCell<T> {
+impl<T, G: FnOnce() -> T> SpinCell<T, G> {
     #[inline(always)]
-    pub const fn new(data: T) -> Self {
-        Self {
-            lock: AtomicBool::new(false),
-            is_initialized: AtomicBool::new(true),
-            cell: MaybeUninit::new(UnsafeCell::new(data)),
-        }
-    }
-
-    #[inline(always)]
-    pub const fn uninit() -> Self {
+    pub const fn new(init_func: G) -> SpinCell<T, G> {
         Self {
             lock: AtomicBool::new(false),
             is_initialized: AtomicBool::new(false),
             cell: MaybeUninit::uninit(),
+            init_func: UnsafeCell::new(ManuallyDrop::new(init_func)),
         }
     }
 
-    pub unsafe fn force_initialize<F>(&self, init_func: F)
-    where
-        F: FnOnce() -> T,
-    {
-        // Acquire the lock. Use compare_exchange to only write when the
-        // lock was previously false; on contention use a relaxed failure
-        // ordering to avoid unnecessary costs.
+    pub unsafe fn force_initialize(&self) {
+        // Acquire the lock exclusively. Use Acquire on success so that the
+        // subsequent reads/writes are properly ordered, and Relaxed on
+        // failure to avoid unnecessary barriers.
         while self
             .lock
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
@@ -47,58 +43,74 @@ impl<T: Sized> SpinCell<T> {
             core::hint::spin_loop();
         }
 
-        // If initialized, drop the value in-place without moving the MaybeUninit
-        // Swap to false and observe the previous value. Use AcqRel so the
-        // operation acts as an acquire for observing the initialized data
-        // (if it was true) and as a release for our write of `false`.
-        if self.is_initialized.swap(false, Ordering::AcqRel) {
-            let cell_ptr = self.cell.as_ptr() as *mut UnsafeCell<T>;
-            unsafe {
-                // Safety: we have exclusive access because we hold the lock,
-                // and we only drop if it was initialized. We cannot call the
-                // consuming `assume_init()` because `self` is borrowed; instead
-                // drop the inner `T` in-place via raw pointers.
-                core::ptr::drop_in_place((*cell_ptr).get());
-            }
+        // If another thread initialized while we were spinning, just release
+        // the lock and return.
+        if self.is_initialized.load(Ordering::Acquire) {
+            self.lock.store(false, Ordering::Release);
+            return;
         }
 
-        // Reinitialize with new value from closure
-        let newcell = UnsafeCell::new(init_func());
+        // Take the initializer and run it.
+        let data = &mut *self.init_func.get();
+        let init_func = ManuallyDrop::take(data);
+        let value = init_func();
+
         let ptr = self.cell.as_ptr() as *mut UnsafeCell<T>;
-        unsafe {
-            // Write the new UnsafeCell<T> into the MaybeUninit slot.
-            core::ptr::write(ptr, newcell);
-        }
+        core::ptr::write(ptr, UnsafeCell::new(value));
+
+        // Publish the initialized value. Use Release so readers that do an
+        // Acquire load on `is_initialized` see the written data.
         self.is_initialized.store(true, Ordering::Release);
 
-        // Release the lock
+        // Release the lock.
         self.lock.store(false, Ordering::Release);
     }
 
-    pub fn try_initialize<F>(&self, init_func: F) -> Result<(), ()>
-    where
-        F: FnOnce() -> T,
-    {
-        // If already initialized, return Err. This check is performed with
-        // Acquire so that a true value implies the data is visible.
-        if self.is_initialized.load(Ordering::Acquire) {
+    pub fn try_initialize(me: &SpinCell<T, G>) -> Result<(), ()> {
+        // Lock SpinCell.
+        // Fast path: if already initialized, return Err.
+        if me.is_initialized.load(Ordering::Acquire) {
             return Err(());
         }
 
-        // Not initialized (as far as we observed) — perform initialization.
-        // `force_initialize` is unsafe, so call it inside an unsafe block.
-        unsafe { self.force_initialize(init_func) };
+        // Not initialized.
+        // `force_initialize` acquires the internal lock and re-checks the
+        // initialized flag to ensure only one thread runs the initializer.
+        unsafe {
+            me.force_initialize();
+        }
         Ok(())
     }
 }
 
-impl<T: Sized> core::ops::Deref for SpinCell<T> {
+impl<T, G: FnOnce() -> T> core::ops::Deref for SpinCell<T, G> {
     type Target = T;
     fn deref(&self) -> &T {
-        assert!(
-            self.is_initialized.load(Ordering::Acquire),
-            "SpinCell is not initialized yet."
-        );
+        match SpinCell::try_initialize(self) {
+            Ok(()) => {}  // Called force_initialize().
+            Err(()) => {} // Cell has already been initilized.
+        }
         unsafe { &*self.cell.assume_init_ref().get() }
+    }
+}
+
+impl<T, G> Drop for SpinCell<T, G> {
+    fn drop(&mut self) {
+        // If the cell was initialized, drop the inner T in-place.
+        if self.is_initialized.load(Ordering::Acquire) {
+            let cell_ptr = self.cell.as_mut_ptr() as *mut UnsafeCell<T>;
+            unsafe {
+                // Safety: we have &mut self so there are no other references
+                // to the contained T; drop it in-place.
+                core::ptr::drop_in_place((*cell_ptr).get());
+            }
+        } else {
+            // The cell was not initialized: the initializer is still
+            // present and must be dropped. We have exclusive access via
+            // &mut self, so it's safe to drop the ManuallyDrop<G>.
+            unsafe {
+                ManuallyDrop::drop(&mut *self.init_func.get());
+            }
+        }
     }
 }
